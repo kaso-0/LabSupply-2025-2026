@@ -16,10 +16,13 @@
 #include "pico/stdlib.h"
 
 /* ── Tunables ─────────────────────────────────────────────────────────── */
-#define WIZ_VIN_MIN_MV       12000   /* lower limit of the supply input        */
+/* Calibrated Vin is in units of 10 mV (like g_cal.vin_min_mV and the main display) */
+#define WIZ_VIN_UNIT_MV      10
+#define WIZ_VIN_MIN          1200    /* 12 V, lower limit of the supply input  */
 #define WIZ_VIN_DROP_PCT     10      /* abort step if Vin drops by more than   */
 #define WIZ_VIN_BAD_TICKS    3       /* consecutive bad samples before abort   */
-#define WIZ_VSET_I_MA        100     /* Iset during the voltage part           */
+#define WIZ_VSET_I_MA        20      /* Iset during the voltage part (gentle inrush) */
+#define WIZ_RAMP_MS          1500    /* V3: Vset ramps up over this time       */
 #define WIZ_ISET_V_MV        3000    /* Vset during the current part           */
 #define WIZ_AVG_SAMPLES      256
 #define WIZ_I4_SETTLE_MS     2000    /* I4: wait after output on               */
@@ -174,8 +177,8 @@ static bool sample_avg(acc_t *a, int n)
     return true;
 }
 
-/* Calibrated Vin (mV) averaged over a few samples, with current g_cal */
-static int32_t vin_now_mV(void)
+/* Calibrated Vin (10 mV units) averaged over a few samples, with current g_cal */
+static int32_t vin_now(void)
 {
     acc_t a;
     if (!sample_avg(&a, 16)) return 0;
@@ -232,7 +235,7 @@ static const step_t STEPS[] = {
     {"I1", ST_ADJUST, CH_I,   "DC mA, range 20mA",  18,   0,    1, 1, "mA",
         {"PART 2: CURRENT", "Short the terminals with", "an ammeter (mA jack).", "Output is off meanwhile."}},
     {"I2", ST_ADJUST, CH_I,   "DC mA, range 200mA", 180,  0,    1, 0, "mA", {NULL}},
-    {"I3", ST_ADJUST, CH_I,   "DC A, range 2A (20A)", 1800, 0, 1000, 3, "A",
+    {"I3", ST_ADJUST, CH_I,   "DC A, range 2A/20A", 1800, 0, 1000, 3, "A",
         {"Move the meter lead to", "the A jack (2A or 20A).", "Output is off meanwhile."}},
     {"I4", ST_MAX,    CH_I,   "DC A, range 20A",     0,   1, 1000, 3, "A",
         {"Move the meter lead to", "the 20A jack.", "Output turns on for 5 s", "only. Read meter fast!"}},
@@ -260,7 +263,7 @@ typedef enum { A_OK, A_SKIP, A_QUIT, A_FAIL } attempt_t;
 
 typedef struct {
     mcp4728     &dac;
-    int          vin_ref_mV;     /* Vin before the output was turned on */
+    int          vin_ref;     /* Vin before the output was turned on */
     const char  *fail_reason;
 } ctx_t;
 
@@ -274,7 +277,7 @@ static void header(const step_t &st, int idx)
 /* Returns true when Vin has been bad for several consecutive checks */
 static bool vin_bad_tick(ctx_t &c, int32_t vin_cal_mV, int *bad_ticks)
 {
-    bool bad = (vin_cal_mV < c.vin_ref_mV - c.vin_ref_mV * WIZ_VIN_DROP_PCT / 100) ||
+    bool bad = (vin_cal_mV < c.vin_ref - c.vin_ref * WIZ_VIN_DROP_PCT / 100) ||
                (g_cal.vin_min_mV > 0 && vin_cal_mV < g_cal.vin_min_mV);
     *bad_ticks = bad ? *bad_ticks + 1 : 0;
     return *bad_ticks >= WIZ_VIN_BAD_TICKS;
@@ -296,14 +299,19 @@ static void show_pre(const step_t &st, int idx)
     put_sep(1);
     uint8_t row = 2;
     for (int i = 0; i < 4 && st.pre[i]; i++) put(row++, i == 0 ? ACT_COL : FG_COL, "%s", st.pre[i]);
+    /* Every step needs a (possibly) different meter range - always say so */
+    put(8, WARN_COL, "!! CHANGE METER RANGE !!");
+    put(9, FG_COL, "Set meter to:");
+    put(10, ACT_COL, "%s", st.meter);
+    put(11, FG_COL, "Output is off meanwhile.");
     put(W_FOOT, DIS_COL, "ENC=OK MODE=skip MENU=quit");
 }
 
-/* Pre-step prompt. Output is off. */
+/* Pre-step prompt (shown before every step). Output is off. */
 static attempt_t prompt_pre(const step_t &st, int idx)
 {
-    if (!st.pre[0]) return A_OK;
     show_pre(st, idx);
+    beep();
     while (true) {
         sleep_ms(5);
         ev_t e = ev_poll();
@@ -453,7 +461,7 @@ static attempt_t adjust_loop(ctx_t &c, const step_t &st, int idx, wpoint_t *out)
                 acc_t a;
                 if (!sample_avg(&a, WIZ_AVG_SAMPLES)) { c.fail_reason = "ADC read error"; outputs_off(c.dac); return A_FAIL; }
                 /* a single low sample in the averaged block is enough to reject it */
-                bool weak = (a.vin_cal_min < c.vin_ref_mV - c.vin_ref_mV * WIZ_VIN_DROP_PCT / 100) ||
+                bool weak = (a.vin_cal_min < c.vin_ref - c.vin_ref * WIZ_VIN_DROP_PCT / 100) ||
                             (g_cal.vin_min_mV > 0 && a.vin_cal_min < g_cal.vin_min_mV);
                 if (weak) { c.fail_reason = "Input supply too weak"; outputs_off(c.dac); return A_FAIL; }
                 out->truth  = (double)st.target;
@@ -476,16 +484,20 @@ static attempt_t adjust_loop(ctx_t &c, const step_t &st, int idx, wpoint_t *out)
     }
 }
 
-/* I4: output on for at most 5 s, ADC averaged automatically, value typed in afterwards */
-static attempt_t max_current(ctx_t &c, const step_t &st, int idx, wpoint_t *out)
+/* V3 and I4: output on for at most 5 s, ADC averaged automatically, value typed in afterwards */
+static attempt_t max_timed(ctx_t &c, const step_t &st, int idx, wpoint_t *out)
 {
     char b[24];
-    int32_t value = setpt_disp(DAC_MAX_CNT, g_cal.iset_gain, g_cal.iset_div, g_cal.iset_off);
+    const bool isv = (st.ch == CH_V);
+    const uint8_t ch_dac = isv ? DAC_CH_C : DAC_CH_D;
+    const adc_channel_t ch_adc = isv ? CHANNEL_VOUT : CHANNEL_IOUT;
+    int32_t value = isv ? setpt_disp(DAC_MAX_CNT, g_cal.vset_gain, g_cal.vset_div, g_cal.vset_off)
+                        : setpt_disp(DAC_MAX_CNT, g_cal.iset_gain, g_cal.iset_div, g_cal.iset_off);
 
     scr_clear();
     header(st, idx);
     put(1, FG_COL, "Meter: %s", st.meter);
-    put(2, ACT_COL, "Max current test");
+    put(2, ACT_COL, isv ? "Max voltage test" : "Max current test");
     put(3, FG_COL, "Output will run for 5 s.");
     put(4, FG_COL, "Read the meter while the");
     put(5, FG_COL, "screen says READ NOW.");
@@ -507,6 +519,8 @@ static attempt_t max_current(ctx_t &c, const step_t &st, int idx, wpoint_t *out)
     acc_reset(&a);
     int bad = 0;
     bool stopped = false;
+    /* Voltage: soft start from 0 instead of a jump to maximum (output capacitors) */
+    if (isv) g_dac_cnt[ch_dac] = 0;
     const uint64_t t0 = time_us_64();
     g_vi_enabled = true;
     dac_update(c.dac);
@@ -517,6 +531,11 @@ static attempt_t max_current(ctx_t &c, const step_t &st, int idx, wpoint_t *out)
         ev_t e = ev_poll();
         if (e.menu()) { outputs_off(c.dac); return A_QUIT; }
         if (e.out() || e.enc()) { stopped = true; break; }
+
+        if (isv && t <= WIZ_RAMP_MS + 100u) {
+            int32_t cnt = t >= WIZ_RAMP_MS ? DAC_MAX_CNT : (int32_t)((int64_t)DAC_MAX_CNT * t / WIZ_RAMP_MS);
+            if (cnt != g_dac_cnt[ch_dac]) { g_dac_cnt[ch_dac] = cnt; dac_update(c.dac); }
+        }
 
         adc_readings_t r;
         if (adc_read_all_channels(&r)) {
@@ -533,7 +552,7 @@ static attempt_t max_current(ctx_t &c, const step_t &st, int idx, wpoint_t *out)
             if (t >= WIZ_I4_SETTLE_MS && t < WIZ_I4_OFF_MS - 500u &&
                 (t < WIZ_I4_AVG_END_MS || a.n < WIZ_AVG_SAMPLES))
                 acc_add(&a, r);
-            fmt_val(b, sizeof(b), r.calibrated[CHANNEL_IOUT], st.disp_div, st.disp_dec, st.unit);
+            fmt_val(b, sizeof(b), r.calibrated[ch_adc], st.disp_div, st.disp_dec, st.unit);
             put(7, FG_COL, "ADC  %s (now)", b);
         }
 
@@ -554,8 +573,8 @@ static attempt_t max_current(ctx_t &c, const step_t &st, int idx, wpoint_t *out)
         return A_FAIL;
     }
 
-    out->x_set  = (double)cnt_to_mv(g_dac_cnt[DAC_CH_D]);
-    out->x_meas = acc_mean(a, CHANNEL_IOUT);
+    out->x_set  = (double)cnt_to_mv(g_dac_cnt[ch_dac]);
+    out->x_meas = acc_mean(a, ch_adc);
     out->id     = st.id;
     attempt_t r = enter_value(c, st, idx, &value, false, true);
     if (r != A_OK) return r;
@@ -570,8 +589,8 @@ static attempt_t attempt(ctx_t &c, const step_t &st, int idx, wpoint_t *out)
     c.fail_reason = NULL;
 
     if (st.ch != CH_VIN) {
-        c.vin_ref_mV = vin_now_mV();
-        if (c.vin_ref_mV < WIZ_VIN_MIN_MV) {
+        c.vin_ref = vin_now();
+        if (c.vin_ref < WIZ_VIN_MIN) {
             c.fail_reason = "Input supply too weak";
             return A_FAIL;
         }
@@ -590,38 +609,21 @@ static attempt_t attempt(ctx_t &c, const step_t &st, int idx, wpoint_t *out)
     if (st.kind == ST_ADJUST)
         return adjust_loop(c, st, idx, out);
 
-    if (st.ch == CH_I)
-        return max_current(c, st, idx, out);
+    /* Maximum voltage / current: output runs only briefly, value typed in afterwards */
+    if (st.ch != CH_VIN)
+        return max_timed(c, st, idx, out);
 
-    /* MAX voltage (output on) and Vin (output off): type in the meter reading */
-    int32_t value;
-    if (st.ch == CH_V) {
-        value = setpt_disp(DAC_MAX_CNT, g_cal.vset_gain, g_cal.vset_div, g_cal.vset_off);
-        g_vi_enabled = true;
-        dac_update(c.dac);
-    } else {
-        value = vin_now_mV();
-    }
-    attempt_t r = enter_value(c, st, idx, &value, st.ch == CH_V, false);
+    /* Vin (output stays off): type in the meter reading */
+    int32_t value = vin_now() * WIZ_VIN_UNIT_MV;   /* entry is in mV */
+    attempt_t r = enter_value(c, st, idx, &value, false, false);
     if (r != A_OK) { outputs_off(c.dac); return r; }
 
     acc_t a;
     if (!sample_avg(&a, WIZ_AVG_SAMPLES)) { outputs_off(c.dac); c.fail_reason = "ADC read error"; return A_FAIL; }
-    if (st.ch == CH_V) {
-        int32_t vm = a.vin_cal_min;
-        if (vm < c.vin_ref_mV - c.vin_ref_mV * WIZ_VIN_DROP_PCT / 100 ||
-            (g_cal.vin_min_mV > 0 && vm < g_cal.vin_min_mV)) {
-            outputs_off(c.dac);
-            c.fail_reason = "Input supply too weak";
-            return A_FAIL;
-        }
-        out->x_set  = (double)cnt_to_mv(g_dac_cnt[DAC_CH_C]);
-        out->x_meas = acc_mean(a, CHANNEL_VOUT);
-    } else {
-        out->x_set  = 0.0;
-        out->x_meas = acc_mean(a, CHANNEL_VIN);
-    }
-    out->truth = (double)value;
+    out->x_set  = 0.0;
+    out->x_meas = acc_mean(a, CHANNEL_VIN);
+    /* Vin is calibrated in 10 mV units, the entry is in mV */
+    out->truth = st.ch == CH_VIN ? (double)value / WIZ_VIN_UNIT_MV : (double)value;
     out->id    = st.id;
     outputs_off(c.dac);
     return A_OK;
@@ -681,10 +683,10 @@ static bool intro(ctx_t &c)
         uint64_t now = time_us_64();
         if (now - last >= 200000u) {
             last = now;
-            int32_t vin = vin_now_mV();
+            int32_t vin = vin_now();
             char b[24];
-            fmt_val(b, sizeof(b), vin, 1000, 2, "V");
-            ok = vin >= WIZ_VIN_MIN_MV;
+            fmt_val(b, sizeof(b), vin, 100, 2, "V");   /* 10 mV units */
+            ok = vin >= WIZ_VIN_MIN;
             put(7, ok ? ON_COL : OFF_COL, "Vin: %s", b);
             put(8, OFF_COL, "%s", ok ? "" : "Vin < 12 V - cannot start");
         }

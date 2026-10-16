@@ -20,7 +20,7 @@ static uint32_t crc32(const uint8_t *d, size_t len)
 const cal_flash_t CAL_DEFAULTS = {
     CAL_MAGIC,
     /* vout */ 110880, 10000, 175,
-    /* vin  */ 10950, 10000, 0,
+    /* vin  */ 10950, 10000, 0,    /* Vin is calibrated in units of 10 mV */
     /* hii  */ 18610, 10000, 15,
     /* iout */ 21190, 10000, 17,
     /* vset */ 164000, 10000, 0,
